@@ -1,0 +1,5 @@
+.env
+*.log
+__pycache__/
+*.rar
+dify_automation.py
