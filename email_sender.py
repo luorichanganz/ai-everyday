@@ -125,14 +125,14 @@ def _wrap_section_titles(html: str) -> str:
         num = str(_Counter.value).zfill(2)
         safe_title = _html.escape(match.group(1))
         return (
-            '<tr><td style="padding:0 50px 16px 50px;">'
+            '<div style="margin:18px 0 12px 0;">'
             '<table cellpadding="0" cellspacing="0" style="width:100%;font-family:-apple-system,BlinkMacSystemFont,\'Microsoft YaHei\',\'PingFang SC\',sans-serif;">'
             '<tr>'
             f'<td style="vertical-align:middle;font-size:38px;font-weight:800;color:#3bdcee;line-height:1;padding-right:16px;letter-spacing:-2px;width:1%;white-space:nowrap;">{num}</td>'
             f'<td style="vertical-align:middle;font-size:22px;font-weight:700;color:#1a1a1a;line-height:1.2;text-align:left;">{safe_title}</td>'
             '</tr>'
             '</table>'
-            '</td></tr>'
+            '</div>'
         )
 
     result = pattern.sub(_replacer, html)
