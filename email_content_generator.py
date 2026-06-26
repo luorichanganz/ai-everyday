@@ -19,7 +19,7 @@ OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 LLM_MODEL = "deepseek/deepseek-v4-pro"
 
 # RSS 源
-RSS_URL = "https://imjuya.github.io/juya-ai-daily/rss.xml"
+RSS_URL = "https://daily.juya.uk/rss.xml"
 
 # ================= AI HOT 每日精选（与 Juya RSS 并列的 AI 日报源） =================
 AI_HOT_RSS_URL = "https://aihot.virxact.com/feed/all.xml"

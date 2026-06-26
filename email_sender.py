@@ -27,6 +27,7 @@ LOG_RECEIVER_EMAIL = os.environ.get("LOG_RECEIVER_EMAIL", "your-log@qq.com")
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE_PATH = os.path.join(CURRENT_DIR, "ai_weekly_briefing.log")
 EMAIL_TEMPLATE_PATH = os.path.join(CURRENT_DIR, "email_template.html")
+GENERATED_EMAIL_DIR = os.path.join(CURRENT_DIR, "已生成的邮件")
 
 def markdown_to_html(text: str) -> str:
     """将 Markdown 格式文本转换为 HTML 片段（纯正则，无第三方依赖）"""
@@ -157,6 +158,125 @@ def render_email_template(content_html: str, formatted_date: str) -> str:
         template = template.replace(placeholder, value)
     return template
 
+
+def _safe_filename_part(text: str, max_length: int = 140) -> str:
+    """将邮件主题转换为 Windows 可用的文件名片段。"""
+    translation = str.maketrans({
+        "<": "＜",
+        ">": "＞",
+        ":": "：",
+        '"': "＂",
+        "/": "／",
+        "\\": "＼",
+        "|": "｜",
+        "?": "？",
+        "*": "＊",
+    })
+    safe_text = text.translate(translation)
+    safe_text = "".join(ch for ch in safe_text if ord(ch) >= 32)
+    safe_text = " ".join(safe_text.split()).strip(" .")
+    return (safe_text or "未命名邮件")[:max_length].rstrip(" .")
+
+
+def save_generated_email_copy(title: str, html_body: str) -> str:
+    """保存一份本次生成的 HTML 邮件副本，并返回文件路径。"""
+    os.makedirs(GENERATED_EMAIL_DIR, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    safe_title = _safe_filename_part(title)
+    html_file = os.path.join(GENERATED_EMAIL_DIR, f"{safe_title}__{timestamp}.html")
+
+    with open(html_file, "w", encoding="utf-8") as f:
+        f.write(html_body)
+
+    logging.info(f"HTML 邮件副本已保存至: {html_file}")
+    return html_file
+
+
+def _plain_text_from_html(html_body: str) -> str:
+    """为旧邮件重发生成纯文本备选内容。"""
+    import re as _re
+
+    text = _re.sub(r"<(script|style).*?>.*?</\1>", "", html_body, flags=_re.DOTALL | _re.IGNORECASE)
+    text = _re.sub(r"<br\s*/?>", "\n", text, flags=_re.IGNORECASE)
+    text = _re.sub(r"</(p|div|tr|h1|h2|h3|li)>", "\n", text, flags=_re.IGNORECASE)
+    text = _re.sub(r"<.*?>", "", text)
+    text = html_module.unescape(text)
+    text = _re.sub(r"\n\s*\n", "\n\n", text)
+    return text.strip()
+
+
+def _send_html_message(title: str, html_body: str, plain_body: str):
+    """按当前收件人配置发送 HTML 邮件。"""
+    msg = MIMEMultipart("alternative")
+    sender_nickname = "每周AI简报助手"
+    msg["From"] = formataddr(
+        (Header(sender_nickname, "utf-8").encode(), SENDER_EMAIL)
+    )
+    msg["To"] = Header(", ".join(RECEIVER_EMAIL), "utf-8")
+    msg["Subject"] = Header(title, "utf-8")
+
+    msg.attach(MIMEText(plain_body, "plain", "utf-8"))
+    msg.attach(MIMEText(html_body, "html", "utf-8"))
+
+    to_addrs = RECEIVER_EMAIL if isinstance(RECEIVER_EMAIL, list) else [RECEIVER_EMAIL]
+
+    logging.info("正在发送邮件...")
+    server = smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT)
+    server.login(SENDER_EMAIL, SENDER_PASSWORD)
+    server.sendmail(SENDER_EMAIL, to_addrs, msg.as_string())
+    server.quit()
+    logging.info(f"邮件已成功发送给：{', '.join(to_addrs)}，共 {len(to_addrs)} 个收件人")
+
+
+def _resolve_generated_email_path(filename: str) -> str:
+    """根据文件名定位“已生成的邮件”目录中的 HTML 文件。"""
+    clean_name = os.path.basename(filename.strip().strip('"').strip("'"))
+    if not clean_name:
+        raise ValueError("请提供要发送的邮件文件名")
+    if not clean_name.lower().endswith(".html"):
+        clean_name = f"{clean_name}.html"
+
+    generated_dir = os.path.abspath(GENERATED_EMAIL_DIR)
+    html_file = os.path.abspath(os.path.join(generated_dir, clean_name))
+    if os.path.dirname(html_file) != generated_dir:
+        raise ValueError("只能选择“已生成的邮件”目录中的文件名")
+    if not os.path.exists(html_file):
+        raise FileNotFoundError(f"未找到已生成邮件: {html_file}")
+    return html_file
+
+
+def _title_from_generated_filename(filename: str) -> str:
+    """根据归档文件名生成默认邮件主题。"""
+    stem = os.path.splitext(os.path.basename(filename))[0]
+    marker = "__"
+    if marker in stem:
+        return stem.rsplit(marker, 1)[0]
+    return stem
+
+
+def send_generated_email(filename: str, dry_run: bool = False):
+    """从“已生成的邮件”目录按文件名选择 HTML 副本并发送。"""
+    html_file = _resolve_generated_email_path(filename)
+    with open(html_file, "r", encoding="utf-8") as f:
+        html_body = f.read()
+
+    title = _title_from_generated_filename(html_file)
+
+    if dry_run:
+        preview_file = os.path.join(CURRENT_DIR, "email_preview.html")
+        with open(preview_file, "w", encoding="utf-8") as f:
+            f.write(html_body)
+        logging.info(f"[DRY RUN] 已生成邮件预览已保存至: {preview_file}")
+        logging.info(f"[DRY RUN] 将发送归档邮件: {html_file}")
+        logging.info(f"[DRY RUN] 邮件主题: {title}")
+        logging.info(f"[DRY RUN] 收件人(未发送): {', '.join(RECEIVER_EMAIL)}, 共 {len(RECEIVER_EMAIL)} 人")
+        return
+
+    plain_body = _plain_text_from_html(html_body)
+    _send_html_message(title, html_body, plain_body)
+    logging.info(f"已发送本地归档邮件: {html_file}")
+
+
 def send_email(title: str, content: str, news_date: str, dry_run: bool = False):
     """发送 HTML 邮件（含纯文本备选）；dry_run=True 时保存到本地文件"""
     # 格式化日期
@@ -175,6 +295,9 @@ def send_email(title: str, content: str, news_date: str, dry_run: bool = False):
 
     # HTML 邮件模板（从外部文件读取，便于自行修改）
     html_body = render_email_template(content_html, formatted_date)
+
+    # 每次生成邮件都保留一份 HTML 副本
+    save_generated_email_copy(title, html_body)
 
     # Dry run：保存 HTML 到本地文件，不发邮件
     if dry_run:
@@ -197,26 +320,7 @@ def send_email(title: str, content: str, news_date: str, dry_run: bool = False):
         f"提示：内容由AI辅助创作，可能存在幻觉和错误。\n"
     )
 
-    # Multipart 消息：HTML + 纯文本备选
-    msg = MIMEMultipart("alternative")
-    sender_nickname = "每周AI简报助手"
-    msg["From"] = formataddr(
-        (Header(sender_nickname, "utf-8").encode(), SENDER_EMAIL)
-    )
-    msg["To"] = Header(", ".join(RECEIVER_EMAIL), "utf-8")
-    msg["Subject"] = Header(title, "utf-8")
-
-    msg.attach(MIMEText(plain_body, "plain", "utf-8"))
-    msg.attach(MIMEText(html_body, "html", "utf-8"))
-
-    to_addrs = RECEIVER_EMAIL if isinstance(RECEIVER_EMAIL, list) else [RECEIVER_EMAIL]
-
-    logging.info("正在发送邮件...")
-    server = smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT)
-    server.login(SENDER_EMAIL, SENDER_PASSWORD)
-    server.sendmail(SENDER_EMAIL, to_addrs, msg.as_string())
-    server.quit()
-    logging.info(f"邮件已成功发送给：{', '.join(to_addrs)}，共 {len(to_addrs)} 个收件人")
+    _send_html_message(title, html_body, plain_body)
 
 
 def send_log_email():

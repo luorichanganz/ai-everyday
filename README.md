@@ -11,7 +11,9 @@ ai-everyday/
 ├── ai_daily_briefing.py        # 主入口：从 0 到发送邮件，只运行这个脚本
 ├── email_content_generator.py  # 生成邮件正文和主题：抓取新闻、筛选去重、调用 LLM
 ├── email_sender.py             # 发送邮件：Markdown 转 HTML、套模板、SMTP 发送
+├── send_generated_email.py     # 手动发送“已生成的邮件”中的 HTML 邮件副本
 ├── email_template.html         # HTML 邮件模板，可自行修改样式
+├── 已生成的邮件/               # 每次生成的 HTML 邮件副本
 ├── .env                        # 环境变量配置，不入库
 ├── .gitignore
 └── README.md
@@ -27,6 +29,8 @@ ai-everyday/
 - LLM 生成周报正文和邮件主题
 - Markdown 正文转 HTML
 - 自动识别正文中的 H2 标题，并套用 `email_template.html` 中的正文标题样式
+- 每次生成邮件都会在 `已生成的邮件/` 中保存一份 HTML 副本
+- 支持按文件名手动发送已生成的邮件，收件人仍使用 `.env` 中的 `RECEIVER_EMAILS`
 - 支持 dry-run 预览，不发送真实邮件
 - 支持 QQ SMTP 自动发送邮件和运行日志邮件
 
@@ -108,6 +112,30 @@ dry-run 会在项目根目录生成：
 email_preview.html
 ```
 
+每次生成邮件还会在 `已生成的邮件/` 中保留一份 HTML 副本，文件名格式为：
+
+```text
+邮件主题__YYYY-MM-DD_HH-MM-SS.html
+```
+
+手动发送某一封已生成邮件：
+
+```bash
+python send_generated_email.py "邮件主题__YYYY-MM-DD_HH-MM-SS.html"
+```
+
+查看可发送的已生成邮件：
+
+```bash
+python send_generated_email.py --list
+```
+
+只预览手动发送的归档邮件，不真实发送：
+
+```bash
+python send_generated_email.py "邮件主题__YYYY-MM-DD_HH-MM-SS.html" --dry-run
+```
+
 建议配合 cron、Windows 任务计划程序或 GitHub Actions 每周执行一次。
 
 ## 运行流程
@@ -123,7 +151,8 @@ email_preview.html
 7. 将正文 Markdown 转成 HTML
 8. 将正文 H2 标题替换为编号标题模板样式
 9. 套用 `email_template.html`
-10. dry-run 保存预览，正式运行则发送邮件
+10. 将 HTML 邮件副本保存到 `已生成的邮件/`
+11. dry-run 保存预览，正式运行则发送邮件
 
 ## HTML 邮件模板
 
