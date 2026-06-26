@@ -3,3 +3,7 @@
 __pycache__/
 *.rar
 dify_automation.py
+/已生成的邮件/
+.agents
+/.checkpoints/
+email_preview.html

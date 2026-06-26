@@ -1,6 +1,6 @@
 # AI 与半导体周报（AI Weekly Briefing）
 
-自动收集多个新闻源和 RSS 源的最近 7 天更新，通过 LLM 总结生成每周 AI 与半导体领域简报邮件，并通过 QQ SMTP 自动发送。
+自动收集多个 RSS、API 和 Web 新闻源的最近 7 天更新，通过 LLM 总结生成每周 AI 与半导体领域简报邮件，并通过 QQ SMTP 自动发送。
 
 ## 当前结构
 
@@ -23,10 +23,11 @@ ai-everyday/
 
 ## 功能
 
-- 多源新闻采集（RSS + Web 抓取）
+- 多源新闻采集（RSS + API + Web 抓取）
 - 最近 7 天内容筛选
 - AI 智能体架构、半导体晶圆制造等方向关键词过滤
 - LLM 生成周报正文和邮件主题
+- 根据原始新闻材料为正文条目自动追加信源链接
 - Markdown 正文转 HTML
 - 自动识别正文中的 H2 标题，并套用 `email_template.html` 中的正文标题样式
 - 每次生成邮件都会在 `已生成的邮件/` 中保存一份 HTML 副本
@@ -50,7 +51,7 @@ ai-everyday/
 | 源 | 类型 | 说明 |
 | --- | --- | --- |
 | Juya AI Daily RSS | RSS | AI 日报，按日期聚合 |
-| AI HOT 每日精选 | RSS | AI 行业动态 |
+| AI HOT 每日精选 | API | AI 行业动态；先取最近 7 期日报索引，再逐日获取日报详情 |
 | Semiconductor Engineering | RSS | 半导体专题 |
 | Semiconductor Digest | RSS | 半导体专题 |
 | SemiWiki | RSS | 半导体专题 |
@@ -143,16 +144,17 @@ python send_generated_email.py "邮件主题__YYYY-MM-DD_HH-MM-SS.html" --dry-ru
 `ai_daily_briefing.py` 是唯一入口，内部流程如下：
 
 1. 调用 `email_content_generator.generate_weekly_email()`
-2. 抓取 Juya、AI HOT、多源半导体新闻
+2. 抓取 Juya RSS、AI HOT API、多源半导体新闻
 3. 筛选最近 7 天且符合关键词方向的内容
 4. 调用 OpenRouter LLM 生成邮件正文
-5. 再调用 LLM 生成邮件主题
-6. 调用 `email_sender.send_email()`
-7. 将正文 Markdown 转成 HTML
-8. 将正文 H2 标题替换为编号标题模板样式
-9. 套用 `email_template.html`
-10. 将 HTML 邮件副本保存到 `已生成的邮件/`
-11. dry-run 保存预览，正式运行则发送邮件
+5. 按新闻材料为正文条目追加来源链接
+6. 再调用 LLM 生成邮件主题
+7. 调用 `email_sender.send_email()`
+8. 将正文 Markdown 转成 HTML
+9. 将正文 H2 标题替换为编号标题模板样式
+10. 套用 `email_template.html`
+11. 将 HTML 邮件副本保存到 `已生成的邮件/`
+12. dry-run 保存预览，正式运行则发送邮件
 
 ## HTML 邮件模板
 
@@ -179,6 +181,7 @@ email_template.html
 
 - **LLM**: OpenRouter API，默认模型 `deepseek/deepseek-v4-pro`
 - **邮件**: QQ SMTP SSL
+- **HTTP 请求**: `requests`，用于 RSS、API 和 Web 新闻源抓取
 - **RSS 解析**: `xml.etree.ElementTree`
 - **HTML 清洗**: 正则表达式 + `html.unescape`
 - **配置加载**: `python-dotenv`

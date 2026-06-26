@@ -1,6 +1,10 @@
+# 功能：将邮件正文渲染成 HTML，套用邮件模板，保存本地副本，并通过 SMTP 发送邮件。
+# 输入：邮件主题、Markdown 正文、新闻日期、.env 中的 SMTP/收件人配置、email_template.html 模板。
+# 输出：发送 HTML 邮件；在 已生成的邮件/ 保存 HTML 副本；dry-run 时生成 email_preview.html。
 import os
 import sys
 import time
+import re
 import html as html_module
 import logging
 import smtplib
@@ -11,6 +15,8 @@ from email.utils import formataddr
 from datetime import datetime
 
 from dotenv import load_dotenv
+
+from checkpoint_manager import clear_checkpoints
 
 load_dotenv(override=True)
 
@@ -164,7 +170,6 @@ def _safe_filename_part(text: str, max_length: int = 140) -> str:
     translation = str.maketrans({
         "<": "＜",
         ">": "＞",
-        ":": "：",
         '"': "＂",
         "/": "／",
         "\\": "＼",
@@ -174,8 +179,10 @@ def _safe_filename_part(text: str, max_length: int = 140) -> str:
     })
     safe_text = text.translate(translation)
     safe_text = "".join(ch for ch in safe_text if ord(ch) >= 32)
-    safe_text = " ".join(safe_text.split()).strip(" .")
-    return (safe_text or "未命名邮件")[:max_length].rstrip(" .")
+    safe_text = safe_text.replace("：", "_").replace(":", "_").replace("_", "_")
+    safe_text = re.sub(r"\s+", "_", safe_text)
+    safe_text = re.sub(r"_+", "_", safe_text).strip(" ._")
+    return (safe_text or "未命名邮件")[:max_length].rstrip(" ._")
 
 
 def save_generated_email_copy(title: str, html_body: str) -> str:
@@ -205,15 +212,22 @@ def _plain_text_from_html(html_body: str) -> str:
     return text.strip()
 
 
+def _subject_for_sending(title: str) -> str:
+    """发送邮件时恢复日期后的冒号，不影响本地归档文件名。"""
+    title = title.strip()
+    return re.sub(r"(\d{4}-\d{2}-\d{2})(?![：:])\s+", r"\1：", title, count=1)
+
+
 def _send_html_message(title: str, html_body: str, plain_body: str):
     """按当前收件人配置发送 HTML 邮件。"""
+    send_title = _subject_for_sending(title)
     msg = MIMEMultipart("alternative")
     sender_nickname = "每周AI简报助手"
     msg["From"] = formataddr(
         (Header(sender_nickname, "utf-8").encode(), SENDER_EMAIL)
     )
     msg["To"] = Header(", ".join(RECEIVER_EMAIL), "utf-8")
-    msg["Subject"] = Header(title, "utf-8")
+    msg["Subject"] = Header(send_title, "utf-8")
 
     msg.attach(MIMEText(plain_body, "plain", "utf-8"))
     msg.attach(MIMEText(html_body, "html", "utf-8"))
@@ -250,8 +264,8 @@ def _title_from_generated_filename(filename: str) -> str:
     stem = os.path.splitext(os.path.basename(filename))[0]
     marker = "__"
     if marker in stem:
-        return stem.rsplit(marker, 1)[0]
-    return stem
+        stem = stem.rsplit(marker, 1)[0]
+    return re.sub(r"_+", " ", stem).strip()
 
 
 def send_generated_email(filename: str, dry_run: bool = False):
@@ -268,7 +282,7 @@ def send_generated_email(filename: str, dry_run: bool = False):
             f.write(html_body)
         logging.info(f"[DRY RUN] 已生成邮件预览已保存至: {preview_file}")
         logging.info(f"[DRY RUN] 将发送归档邮件: {html_file}")
-        logging.info(f"[DRY RUN] 邮件主题: {title}")
+        logging.info(f"[DRY RUN] 邮件主题: {_subject_for_sending(title)}")
         logging.info(f"[DRY RUN] 收件人(未发送): {', '.join(RECEIVER_EMAIL)}, 共 {len(RECEIVER_EMAIL)} 人")
         return
 
@@ -298,6 +312,7 @@ def send_email(title: str, content: str, news_date: str, dry_run: bool = False):
 
     # 每次生成邮件都保留一份 HTML 副本
     save_generated_email_copy(title, html_body)
+    clear_checkpoints()
 
     # Dry run：保存 HTML 到本地文件，不发邮件
     if dry_run:

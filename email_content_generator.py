@@ -1,3 +1,6 @@
+# 功能：抓取 AI 与半导体相关新闻源，筛选去重后调用 LLM 生成邮件正文和主题，并用脚本追加信源。
+# 输入：.env 中的 OpenRouter 配置、RSS/Web 新闻源内容、LLM 生成结果。
+# 输出：generate_weekly_email() 返回 (邮件主题, 邮件正文, 新闻日期)；正文中的新闻条目会追加来源链接或来源描述。
 import os
 import re
 import time
@@ -9,6 +12,8 @@ from datetime import datetime, timedelta, timezone
 
 import requests
 from dotenv import load_dotenv
+
+from checkpoint_manager import get_checkpoint_step, load_checkpoint, save_checkpoint_step
 
 load_dotenv(override=True)
 
@@ -22,7 +27,14 @@ LLM_MODEL = "deepseek/deepseek-v4-pro"
 RSS_URL = "https://daily.juya.uk/rss.xml"
 
 # ================= AI HOT 每日精选（与 Juya RSS 并列的 AI 日报源） =================
-AI_HOT_RSS_URL = "https://aihot.virxact.com/feed/all.xml"
+AI_HOT_BASE_URL = "https://aihot.virxact.com"
+AI_HOT_API_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    )
+}
 
 # ================= 多源半导体与AI新闻配置 =================
 # 新增 RSS/Web 来源列表
@@ -202,6 +214,77 @@ def _strip_html(text: str | None) -> str:
     return text.strip()
 
 
+def _extract_links_from_html(text: str | None) -> list[str]:
+    """按出现顺序从 HTML/文本中提取链接。"""
+    if not text:
+        return []
+
+    text = html_module.unescape(text)
+    links: list[str] = []
+    for href in re.findall(r'href=["\']([^"\']+)["\']', text, flags=re.IGNORECASE):
+        links.append(href.strip())
+    for url in re.findall(r"https?://[^\s\"'<>)）]+", text):
+        links.append(url.strip())
+
+    seen = set()
+    result = []
+    for link in links:
+        if link and link not in seen:
+            seen.add(link)
+            result.append(link)
+    return result
+
+
+def _source_label_from_link(link: str) -> str:
+    """根据链接域名生成来源名称。"""
+    lower = link.lower()
+    if "x.com/" in lower or "twitter.com/" in lower:
+        return "X/Twitter"
+    if "arxiv.org" in lower:
+        return "arXiv"
+    if "openreview.net" in lower:
+        return "OpenReview"
+    if "doi.org" in lower:
+        return "DOI"
+
+    match = re.search(r"https?://(?:www\.)?([^/]+)", link)
+    if match:
+        return match.group(1)
+    return "原始信源"
+
+
+def _pick_original_link_from_secondary_source(article: dict, aggregator_domains: tuple[str, ...]) -> tuple[str, str] | None:
+    """从二手聚合源条目中挑选最早/原始信息链接。"""
+    raw_text = "\n".join(
+        str(article.get(key, ""))
+        for key in ("raw_description", "raw_content", "description")
+    )
+    links = _extract_links_from_html(raw_text)
+    if not links:
+        return None
+
+    preferred_markers = (
+        "x.com/", "twitter.com/", "arxiv.org", "openreview.net",
+        "doi.org", ".pdf", "github.com",
+    )
+
+    def is_external(link: str) -> bool:
+        lower = link.lower()
+        return not any(domain in lower for domain in aggregator_domains)
+
+    external_links = [link for link in links if is_external(link)]
+    if not external_links:
+        return None
+
+    for marker in preferred_markers:
+        for link in external_links:
+            if marker in link.lower():
+                return link, _source_label_from_link(link)
+
+    first_link = external_links[0]
+    return first_link, _source_label_from_link(first_link)
+
+
 def _parse_rss_date(date_str: str | None) -> datetime | None:
     """解析 RSS pubDate 为 datetime 对象"""
     if not date_str:
@@ -263,6 +346,8 @@ def fetch_rss_feed(url: str, source_name: str) -> list[dict]:
             link = link_el.get("href", "")
         pubdate = pubdate_el.text if pubdate_el is not None and pubdate_el.text else ""
         description = desc_el.text if desc_el is not None and desc_el.text else ""
+        raw_description = description
+        raw_content = ""
 
         # 尝试获取 content:encoded（WordPress 站点常见，含完整正文）
         content_encoded_el = item.find(
@@ -271,6 +356,7 @@ def fetch_rss_feed(url: str, source_name: str) -> list[dict]:
         if content_encoded_el is not None and content_encoded_el.text:
             # 用 content:encoded 补充 description（用于更准确的关键词匹配）
             full_text = content_encoded_el.text
+            raw_content = full_text
             description = (
                 f"{description}\n{_strip_html(full_text)[:500]}"
                 if description
@@ -292,6 +378,8 @@ def fetch_rss_feed(url: str, source_name: str) -> list[dict]:
             "description": _strip_html(description),
             "source": source_name,
             "categories": categories,
+            "raw_description": raw_description,
+            "raw_content": raw_content,
         })
 
     logging.info(f"[{source_name}] 获取 {len(articles)} 篇文章")
@@ -516,7 +604,8 @@ def extract_weekly_news(raw_html: str) -> tuple[str, str]:
 
             lines = [line.strip() for line in day_content.split("\n") if line.strip()]
             if lines:
-                all_content.append(f"--- {date_str} ---\n" + "\n".join(lines))
+                source_note = f"信源: Juya AI Daily RSS（{RSS_URL}），日期: {date_str}"
+                all_content.append(f"--- {date_str} ---\n{source_note}\n" + "\n".join(lines))
                 matched_dates.append(date_str)
 
     if not all_content:
@@ -534,15 +623,155 @@ def extract_weekly_news(raw_html: str) -> tuple[str, str]:
     return final_text, end_date
 
 
+def _aihot_get_json(path: str, params: dict | None = None) -> dict | None:
+    """请求 AI HOT 公共 API，返回 JSON 数据。"""
+    url = f"{AI_HOT_BASE_URL}{path}"
+    resp = requests.get(
+        url,
+        headers=AI_HOT_API_HEADERS,
+        params=params,
+        timeout=30,
+    )
+    if resp.status_code == 404:
+        return None
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _get_recent_aihot_daily_index(take: int = 7) -> list[dict]:
+    """获取最近 N 期 AI HOT 日报索引。"""
+    data = _aihot_get_json("/api/public/dailies", params={"take": take})
+    if not data:
+        return []
+    items = data.get("items", [])
+    if not isinstance(items, list):
+        return []
+    return [item for item in items if isinstance(item, dict) and item.get("date")]
+
+
+def _get_aihot_daily(date_str: str) -> dict | None:
+    """获取某一天 AI HOT 日报详情。"""
+    return _aihot_get_json(f"/api/public/daily/{date_str}")
+
+
+def _first_text(*values) -> str:
+    """返回第一个非空文本字段。"""
+    for value in values:
+        if value is None:
+            continue
+        text = _strip_html(str(value)).strip()
+        if text:
+            return text
+    return ""
+
+
+def _aihot_item_to_article(item: dict, daily: dict, category: str) -> dict | None:
+    """将 AI HOT API 条目转换成项目内部文章结构。"""
+    title = _first_text(item.get("title"), item.get("headline"), item.get("name"))
+    description = _first_text(
+        item.get("summary"),
+        item.get("description"),
+        item.get("content"),
+        item.get("abstract"),
+    )
+    if not title and not description:
+        return None
+
+    link = _first_text(
+        item.get("sourceUrl"),
+        item.get("url"),
+        item.get("link"),
+        item.get("href"),
+    )
+    source = _first_text(item.get("sourceName"), item.get("source"), item.get("site"))
+    if not source:
+        source = _source_label_from_link(link) if link else "原始信源"
+
+    date_str = _first_text(
+        item.get("publishedAt"),
+        item.get("date"),
+        daily.get("generatedAt"),
+        daily.get("date"),
+    )
+    categories = [category] if category else []
+
+    return {
+        "title": title,
+        "link": link,
+        "date": date_str,
+        "description": description,
+        "source": source,
+        "categories": categories,
+        "aggregator_source": "AI HOT 每日精选",
+        "aggregator_link": f"{AI_HOT_BASE_URL}/daily/{daily.get('date', '')}",
+    }
+
+
+def _extract_aihot_articles_from_daily(daily: dict) -> list[dict]:
+    """从单日 AI HOT 日报详情中提取文章列表。"""
+    articles: list[dict] = []
+
+    def append_items(items, category: str) -> None:
+        if not isinstance(items, list):
+            return
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            article = _aihot_item_to_article(item, daily, category)
+            if article:
+                articles.append(article)
+
+    sections = daily.get("sections", [])
+    if isinstance(sections, list):
+        for section in sections:
+            if not isinstance(section, dict):
+                continue
+            category = _first_text(section.get("label"), section.get("title"), section.get("name"))
+            append_items(section.get("items"), category)
+
+    append_items(daily.get("items"), "")
+    append_items(daily.get("flashes"), "快讯")
+
+    lead = daily.get("lead")
+    if isinstance(lead, dict):
+        article = _aihot_item_to_article(lead, daily, "头条")
+        if article:
+            articles.insert(0, article)
+
+    return articles
+
+
 def fetch_aihot_news() -> str:
     """获取 AI HOT 每日精选（与 Juya RSS 并列的 AI 日报源），返回格式化文本"""
     source_name = "AI HOT 每日精选"
     logging.info(f"[{source_name}] 正在获取 AI 行业动态...")
 
     try:
-        articles = fetch_rss_feed(AI_HOT_RSS_URL, source_name)
+        daily_index = _get_recent_aihot_daily_index(7)
+        if not daily_index:
+            logging.warning(f"[{source_name}] 未获取到日报索引")
+            return ""
+
+        articles: list[dict] = []
+        for index, item in enumerate(daily_index):
+            date_str = item["date"]
+            logging.info(f"[{source_name}] 正在获取 {date_str} 日报...")
+            daily = _get_aihot_daily(date_str)
+            if daily is None:
+                logging.warning(f"[{source_name}] {date_str} 不存在日报")
+                continue
+
+            daily_articles = _extract_aihot_articles_from_daily(daily)
+            logging.info(
+                f"[{source_name}] {date_str} 提取 {len(daily_articles)} 条"
+            )
+            articles.extend(daily_articles)
+
+            if index < len(daily_index) - 1:
+                time.sleep(0.3)
+
         if not articles:
-            logging.warning(f"[{source_name}] 未获取到文章")
+            logging.warning(f"[{source_name}] 未获取到日报条目")
             return ""
 
         # 按四大方向关键词过滤
@@ -611,7 +840,10 @@ def format_articles_for_llm(articles: list[dict]) -> str:
         tags = _classify_article(a)
         tag_str = f" [{', '.join(tags)}]" if tags else ""
         lines.append(f"{i}. [{a['source']}]{tag_str} {a['title']}")
+        lines.append(f"   信源: {a['source']}")
         lines.append(f"   链接: {a['link']}")
+        if a.get("aggregator_source"):
+            lines.append(f"   聚合源: {a['aggregator_source']}")
         lines.append(f"   日期: {a['date']}")
         if a.get("description"):
             desc = a["description"][:300]
@@ -717,6 +949,192 @@ def call_llm(system_prompt: str, user_message: str = "") -> str:
     return content
 
 
+def _source_references_from_news_text(news_text: str) -> list[dict]:
+    """从给 LLM 的新闻材料中提取可用于后处理追加的信源信息。"""
+    refs: list[dict] = []
+    current: dict | None = None
+    current_generic_source = ""
+
+    def flush_current():
+        nonlocal current
+        if current:
+            refs.append(current)
+            current = None
+
+    for raw_line in news_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            flush_current()
+            continue
+
+        article_match = re.match(r"^\d+\.\s+\[([^\]]+)\](?:\s+\[[^\]]+\])?\s+(.+)$", line)
+        if article_match:
+            flush_current()
+            current = {
+                "source": article_match.group(1).strip(),
+                "title": article_match.group(2).strip(),
+                "link": "",
+                "date": "",
+                "description": "",
+            }
+            continue
+
+        if line.startswith("信源:"):
+            source_text = line.split(":", 1)[1].strip()
+            if current is not None:
+                current["source"] = source_text
+            else:
+                current_generic_source = source_text
+                refs.append({
+                    "source": source_text,
+                    "title": "",
+                    "link": "",
+                    "date": "",
+                    "description": source_text,
+                })
+            continue
+
+        if current is None:
+            continue
+
+        if line.startswith("链接:"):
+            current["link"] = line.split(":", 1)[1].strip()
+        elif line.startswith("日期:"):
+            current["date"] = line.split(":", 1)[1].strip()
+        elif line.startswith("摘要:"):
+            current["description"] = line.split(":", 1)[1].strip()
+        elif line.startswith("分类:"):
+            current["description"] = f"{current.get('description', '')} {line}".strip()
+        elif line.startswith("聚合源:"):
+            current["aggregator_source"] = line.split(":", 1)[1].strip()
+
+    flush_current()
+
+    if current_generic_source and not any(ref.get("source") == current_generic_source for ref in refs):
+        refs.append({
+            "source": current_generic_source,
+            "title": "",
+            "link": "",
+            "date": "",
+            "description": current_generic_source,
+        })
+
+    return refs
+
+
+def _match_tokens(text: str) -> set[str]:
+    """提取用于来源匹配的强关键词，避免用泛词造成误配。"""
+    text = re.sub(r"\*\*|__|`|\[|\]|\(|\)|（来源[:：].*?）|（论文链接[:：].*?）", " ", text)
+    common_en = {
+        "about", "after", "again", "agent", "agents", "also", "based", "before",
+        "chip", "chips", "could", "first", "foundry", "framework", "from",
+        "into", "latest", "model", "models", "more", "news", "paper",
+        "release", "released", "says", "semiconductor", "system", "systems",
+        "that", "this", "update", "updates", "using", "wafer", "with",
+    }
+    common_zh = {
+        "人工智能", "半导体", "晶圆", "制造", "模型", "发布", "更新", "技术",
+        "架构", "框架", "应用", "相关", "最新", "动态", "系统", "工具",
+        "平台", "能力", "优化", "提升", "设计", "智能", "行业",
+    }
+    tokens = set()
+    for token in re.findall(r"[A-Za-z0-9][A-Za-z0-9_.+-]{3,}", text.lower()):
+        if token not in common_en:
+            tokens.add(token)
+    for chunk in re.findall(r"[\u4e00-\u9fff]{3,}", text):
+        if chunk not in common_zh:
+            tokens.add(chunk[:14])
+    return tokens
+
+
+def _source_match_score(content_line: str, ref: dict) -> int:
+    line_tokens = _match_tokens(content_line)
+    title_tokens = _match_tokens(ref.get("title", ""))
+    description_tokens = _match_tokens(ref.get("description", ""))
+    if not line_tokens or not title_tokens:
+        return 0
+
+    title_overlap = line_tokens & title_tokens
+    if not title_overlap:
+        return 0
+
+    description_overlap = line_tokens & description_tokens
+    score = len(title_overlap) * 10 + min(len(description_overlap), 5)
+    title = ref.get("title", "")
+    if title and (title.lower() in content_line.lower() or content_line.lower() in title.lower()):
+        score += 20
+    return score
+
+
+def _is_paper_source(ref: dict) -> bool:
+    link = ref.get("link", "").lower()
+    source = ref.get("source", "").lower()
+
+    if "x.com/" in link or "twitter.com/" in link:
+        return False
+
+    paper_link_markers = (
+        "arxiv.org", "openreview.net", "doi.org",
+        "biorxiv.org", "medrxiv.org", "ssrn.com", ".pdf",
+    )
+    if any(marker in link for marker in paper_link_markers):
+        return True
+
+    paper_source_markers = ("arxiv", "openreview", "biorxiv", "medrxiv", "ssrn", "doi")
+    return any(marker in source for marker in paper_source_markers)
+
+
+def _source_suffix(ref: dict) -> str:
+    link = ref.get("link", "").strip()
+    source = ref.get("source", "").strip()
+    description = ref.get("description", "").strip()
+
+    if link:
+        if _is_paper_source(ref):
+            return f"（论文链接：{link}）"
+        return f"（来源：[{source or '原文'}]({link})）"
+
+    return f"（来源：{source or description or '信源未提供链接'}）"
+
+
+def append_sources_to_email_content(email_content: str, news_text: str) -> str:
+    """不调用 AI，按新闻材料为正文中的新闻条目追加来源。"""
+    refs = _source_references_from_news_text(news_text)
+    if not refs:
+        logging.warning("未能从新闻材料中提取信源，跳过来源追加")
+        return email_content
+
+    output_lines = []
+    in_trend_section = False
+    appended_count = 0
+
+    for line in email_content.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("## "):
+            in_trend_section = "趋势" in stripped
+
+        is_bullet = stripped.startswith("* ") or stripped.startswith("- ")
+        has_source = "（来源：" in stripped or "（论文链接：" in stripped
+
+        if is_bullet and not in_trend_section and not has_source:
+            best_ref = None
+            best_score = 0
+            for ref in refs:
+                score = _source_match_score(stripped, ref)
+                if score > best_score:
+                    best_ref = ref
+                    best_score = score
+
+            if best_ref and best_score >= 2:
+                line = f"{line}{_source_suffix(best_ref)}"
+                appended_count += 1
+
+        output_lines.append(line)
+
+    logging.info(f"已通过脚本为 {appended_count} 条正文信息追加来源")
+    return "\n".join(output_lines)
+
+
 
 def generate_email_content(news_text: str) -> str:
     """生成邮件正文（约1500-2000字总结 + 趋势洞察）"""
@@ -724,6 +1142,7 @@ def generate_email_content(news_text: str) -> str:
         "你是一位大语言模型与半导体领域的专家。以下是最近一周（7天）内更新的AI与半导体领域新闻。\n"
         "请根据这些新闻内容总结，以电子邮件的形式输出约1500-2000字的总结结果以及两百字左右的趋势洞察。\n\n"
         "趋势洞察部分请务必使用分点、换行格式（每条趋势以 * 开头，换行分隔）。\n"
+        "不要在正文中自行添加来源、链接、参考资料或脚注；来源会由程序在生成后自动追加。\n"
         "注意：只输出电子邮件正文的内容，不要输出任何其他信息，不需要开场白，不需要问候语，直接输出内容。\n\n"
         "请分别覆盖以下两个主题：\n\n"
         "1. AI 智能体架构（Agent Architecture）相关动态\n"
@@ -745,7 +1164,7 @@ def generate_email_content(news_text: str) -> str:
         '输出示例：\n'
         '## AI 智能体架构\n\n'
         '### 一、Agent 架构与框架演进\n\n'
-        '* **Open Claw 架构最新进展：**\n'
+        '* **Open Claw 架构最新进展：** ...\n'
         '* **多智能体协作框架：** ...\n\n'
         '### 二、提示词工程与 Context Engineering\n\n'
         '* **提示词自动优化技术：** ...\n'
@@ -779,58 +1198,109 @@ def generate_email_subject(email_body: str, news_date: str) -> str:
     return call_llm(system_prompt, email_body)
 
 
+def sanitize_email_subject(subject: str) -> str:
+    """清理 LLM 生成的邮件主题，去除冒号和下划线。"""
+    subject = subject.strip().strip('"').strip("'")
+    subject = subject.replace("：", " ").replace(":", " ").replace("_", " ")
+    subject = re.sub(r"\s+", " ", subject)
+    return subject.strip()
+
+
 
 
 def generate_weekly_email() -> tuple[str, str, str] | None:
     """生成本周邮件标题、正文和新闻日期。"""
     today_str = datetime.now().strftime("%Y-%m-%d")
+    checkpoint = load_checkpoint()
 
     # 1. 获取 AI 日报源（Juya + AI HOT 并列）
     news_text_parts: list[str] = []
 
     # 1a. Juya AI Daily RSS
-    try:
-        raw_html = fetch_rss()
-        juya_news, news_date = extract_weekly_news(raw_html)
-        if juya_news:
-            logging.info(f"Juya RSS 获取成功，内容长度: {len(juya_news)} 字符")
-            news_text_parts.append(juya_news)
-        else:
-            logging.warning("Juya RSS 未提取到最近7天新闻")
+    juya_checkpoint = get_checkpoint_step(checkpoint, "juya_news")
+    if juya_checkpoint is not None:
+        juya_news = juya_checkpoint.get("juya_news", "")
+        news_date = juya_checkpoint.get("news_date", today_str)
+        logging.info("从 checkpoint 恢复 Juya RSS 内容")
+    else:
+        try:
+            raw_html = fetch_rss()
+            juya_news, news_date = extract_weekly_news(raw_html)
+            if juya_news:
+                logging.info(f"Juya RSS 获取成功，内容长度: {len(juya_news)} 字符")
+            else:
+                logging.warning("Juya RSS 未提取到最近7天新闻")
+                news_date = today_str
+        except Exception as e:
+            logging.warning(f"Juya RSS 获取失败: {e}")
+            juya_news = ""
             news_date = today_str
-    except Exception as e:
-        logging.warning(f"Juya RSS 获取失败: {e}")
-        news_date = today_str
+        save_checkpoint_step("juya_news", {
+            "juya_news": juya_news,
+            "news_date": news_date,
+        })
+
+    if juya_news:
+        news_text_parts.append(juya_news)
 
     # 1b. AI HOT 每日精选（与 Juya 并列的 AI 行业动态源）
-    try:
-        aihot_news = fetch_aihot_news()
-        if aihot_news:
-            logging.info(f"AI HOT 获取成功，内容长度: {len(aihot_news)} 字符")
-            news_text_parts.append(
-                "=== 以下来自 AI HOT 每日精选（最近7天） ===\n\n"
-                f"{aihot_news}"
-            )
-        else:
-            logging.warning("AI HOT 未获取到内容")
-    except Exception as e:
-        logging.warning(f"AI HOT 获取失败: {e}")
+    aihot_checkpoint = get_checkpoint_step(checkpoint, "aihot_news")
+    if aihot_checkpoint is not None:
+        aihot_news = aihot_checkpoint.get("aihot_news", "")
+        logging.info("从 checkpoint 恢复 AI HOT 内容")
+    else:
+        try:
+            aihot_news = fetch_aihot_news()
+            if aihot_news:
+                logging.info(f"AI HOT 获取成功，内容长度: {len(aihot_news)} 字符")
+            else:
+                logging.warning("AI HOT 未获取到内容")
+        except Exception as e:
+            logging.warning(f"AI HOT 获取失败: {e}")
+            aihot_news = ""
+        save_checkpoint_step("aihot_news", {"aihot_news": aihot_news})
+
+    if aihot_news:
+        news_text_parts.append(
+            "=== 以下来自 AI HOT 每日精选（最近7天） ===\n\n"
+            f"{aihot_news}"
+        )
 
     # 2. 获取多源半导体与AI新闻
-    logging.info("=" * 40)
-    logging.info("开始获取多源半导体与AI新闻...")
-    multi_source_news = fetch_all_news()
+    multi_source_checkpoint = get_checkpoint_step(checkpoint, "multi_source_news")
+    if multi_source_checkpoint is not None:
+        multi_source_news = multi_source_checkpoint.get("multi_source_news", "")
+        logging.info("从 checkpoint 恢复多源新闻内容")
+    else:
+        logging.info("=" * 40)
+        logging.info("开始获取多源半导体与AI新闻...")
+        multi_source_news = fetch_all_news()
+        if multi_source_news:
+            logging.info(f"多源新闻获取成功，内容长度: {len(multi_source_news)} 字符")
+        else:
+            logging.warning("多源新闻获取为空")
+        save_checkpoint_step("multi_source_news", {
+            "multi_source_news": multi_source_news,
+        })
+
     if multi_source_news:
-        logging.info(f"多源新闻获取成功，内容长度: {len(multi_source_news)} 字符")
         news_text_parts.append(
             "=== 以下来自多源半导体与AI新闻采集（最近7天） ===\n\n"
             f"{multi_source_news}"
         )
-    else:
-        logging.warning("多源新闻获取为空")
 
     # 3. 合并所有内容
-    combined_news_text = "\n\n".join(news_text_parts)
+    combined_checkpoint = get_checkpoint_step(checkpoint, "combined_news_text")
+    if combined_checkpoint is not None:
+        combined_news_text = combined_checkpoint.get("combined_news_text", "")
+        news_date = combined_checkpoint.get("news_date", news_date)
+        logging.info("从 checkpoint 恢复合并新闻内容")
+    else:
+        combined_news_text = "\n\n".join(news_text_parts)
+        save_checkpoint_step("combined_news_text", {
+            "combined_news_text": combined_news_text,
+            "news_date": news_date,
+        })
 
     if not combined_news_text.strip():
         logging.warning("所有新闻源均未获取到内容，任务终止")
@@ -839,13 +1309,40 @@ def generate_weekly_email() -> tuple[str, str, str] | None:
     logging.info(f"合并总内容长度: {len(combined_news_text)} 字符")
 
     # 4. 生成邮件正文
-    logging.info("开始生成邮件正文...")
-    email_content = generate_email_content(combined_news_text)
+    raw_content_checkpoint = get_checkpoint_step(checkpoint, "email_content_raw")
+    if raw_content_checkpoint is not None:
+        email_content_raw = raw_content_checkpoint.get("email_content_raw", "")
+        logging.info("从 checkpoint 恢复 LLM 邮件正文")
+    else:
+        logging.info("开始生成邮件正文...")
+        email_content_raw = generate_email_content(combined_news_text)
+        save_checkpoint_step("email_content_raw", {
+            "email_content_raw": email_content_raw,
+        })
+
+    sourced_content_checkpoint = get_checkpoint_step(checkpoint, "email_content_with_sources")
+    if sourced_content_checkpoint is not None:
+        email_content = sourced_content_checkpoint.get("email_content", "")
+        logging.info("从 checkpoint 恢复已追加来源的邮件正文")
+    else:
+        email_content = append_sources_to_email_content(email_content_raw, combined_news_text)
+        save_checkpoint_step("email_content_with_sources", {
+            "email_content": email_content,
+        })
     logging.info(f"邮件正文:\n{email_content}")
 
     # 5. 生成邮件主题
-    logging.info("开始生成邮件主题...")
-    email_title = generate_email_subject(email_content, news_date)
+    title_checkpoint = get_checkpoint_step(checkpoint, "email_title")
+    if title_checkpoint is not None:
+        email_title = title_checkpoint.get("email_title", "")
+        logging.info("从 checkpoint 恢复邮件主题")
+    else:
+        logging.info("开始生成邮件主题...")
+        email_title = sanitize_email_subject(generate_email_subject(email_content, news_date))
+        save_checkpoint_step("email_title", {
+            "email_title": email_title,
+            "news_date": news_date,
+        })
     logging.info(f"邮件主题: {email_title}")
 
     return email_title, email_content, news_date

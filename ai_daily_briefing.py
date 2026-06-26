@@ -1,4 +1,7 @@
-﻿import os
+# 功能：AI 与半导体周报的主入口脚本，串联“生成邮件正文/标题”和“发送邮件”两个模块。
+# 输入：命令行参数 --dry-run/--dry、.env 中的 OpenRouter 与 SMTP 配置、各新闻源在线内容。
+# 输出：正式模式下发送周报邮件和运行日志邮件；dry-run 模式下生成 HTML 预览和本地邮件副本。
+import os
 import sys
 import time
 import logging
