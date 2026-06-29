@@ -13,10 +13,13 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.utils import formataddr
 from datetime import datetime
+from urllib.parse import urlparse
 
-from dotenv import load_dotenv
-
-from checkpoint_manager import clear_checkpoints
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    def load_dotenv(*args, **kwargs):
+        return False
 
 load_dotenv(override=True)
 
@@ -34,6 +37,41 @@ CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE_PATH = os.path.join(CURRENT_DIR, "ai_weekly_briefing.log")
 EMAIL_TEMPLATE_PATH = os.path.join(CURRENT_DIR, "email_template.html")
 GENERATED_EMAIL_DIR = os.path.join(CURRENT_DIR, "已生成的邮件")
+_PLACEHOLDER_VALUES = {
+    "",
+    "your-sender@qq.com",
+    "your-email-auth-code",
+    "your-log@qq.com",
+}
+_ALLOWED_LINK_SCHEMES = {"http", "https", "mailto"}
+
+
+def validate_email_config(require_receivers: bool = True, require_log_receiver: bool = False):
+    """在真实发信前校验 SMTP 配置，避免生成完才失败。"""
+    missing = []
+    if SENDER_EMAIL in _PLACEHOLDER_VALUES or "@" not in SENDER_EMAIL:
+        missing.append("SENDER_EMAIL")
+    if SENDER_PASSWORD in _PLACEHOLDER_VALUES:
+        missing.append("SENDER_PASSWORD")
+    if require_receivers and not RECEIVER_EMAIL:
+        missing.append("RECEIVER_EMAILS")
+    if require_log_receiver and LOG_RECEIVER_EMAIL in _PLACEHOLDER_VALUES:
+        missing.append("LOG_RECEIVER_EMAIL")
+    if missing:
+        raise RuntimeError(f"邮件配置缺失或仍为占位值: {', '.join(missing)}")
+
+
+def _safe_markdown_url(url: str) -> str | None:
+    """仅允许邮件中出现常见安全链接协议。"""
+    clean_url = html_module.unescape(url).strip()
+    if any(ord(ch) < 32 for ch in clean_url):
+        return None
+    parsed = urlparse(clean_url)
+    if parsed.scheme.lower() not in _ALLOWED_LINK_SCHEMES:
+        return None
+    if parsed.scheme.lower() in {"http", "https"} and not parsed.netloc:
+        return None
+    return clean_url
 
 def markdown_to_html(text: str) -> str:
     """将 Markdown 格式文本转换为 HTML 片段（纯正则，无第三方依赖）"""
@@ -108,12 +146,27 @@ def markdown_to_html(text: str) -> str:
 def _inline_markdown(text: str) -> str:
     """转换行内 Markdown：**粗体**、*斜体*、[链接](url)"""
     import re as _re
+
+    link_tokens: list[str] = []
+
+    def _link_replacer(match: _re.Match) -> str:
+        label = html_module.escape(match.group(1), quote=False)
+        safe_url = _safe_markdown_url(match.group(2))
+        if not safe_url:
+            link_tokens.append(label)
+        else:
+            href = html_module.escape(safe_url, quote=True)
+            link_tokens.append(f'<a href="{href}">{label}</a>')
+        return f"\x00LINK{len(link_tokens) - 1}\x00"
+
+    text = _re.sub(r"\[([^\]]+)\]\(([^)]+)\)", _link_replacer, text)
+    text = html_module.escape(text, quote=False)
     # 粗体 **xxx**
     text = _re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", text)
     # 斜体 *xxx*（排除列表标记）
     text = _re.sub(r"(?<!\*)\*(?!\*)([^*]+?)(?<!\*)\*(?!\*)", r"<em>\1</em>", text)
-    # 链接 [text](url)
-    text = _re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r'<a href="\2">\1</a>', text)
+    for index, token in enumerate(link_tokens):
+        text = text.replace(f"\x00LINK{index}\x00", token)
     return text
 
 
@@ -130,7 +183,8 @@ def _wrap_section_titles(html: str) -> str:
     def _replacer(match: _re.Match) -> str:
         _Counter.value += 1
         num = str(_Counter.value).zfill(2)
-        safe_title = _html.escape(match.group(1))
+        plain_title = _re.sub(r"<.*?>", "", _html.unescape(match.group(1)))
+        safe_title = _html.escape(plain_title)
         return (
             '<div style="margin:18px 0 12px 0;">'
             '<table cellpadding="0" cellspacing="0" style="width:100%;font-family:-apple-system,BlinkMacSystemFont,\'Microsoft YaHei\',\'PingFang SC\',sans-serif;">'
@@ -220,6 +274,7 @@ def _subject_for_sending(title: str) -> str:
 
 def _send_html_message(title: str, html_body: str, plain_body: str):
     """按当前收件人配置发送 HTML 邮件。"""
+    validate_email_config(require_receivers=True)
     send_title = _subject_for_sending(title)
     msg = MIMEMultipart("alternative")
     sender_nickname = "每周AI简报助手"
@@ -235,10 +290,9 @@ def _send_html_message(title: str, html_body: str, plain_body: str):
     to_addrs = RECEIVER_EMAIL if isinstance(RECEIVER_EMAIL, list) else [RECEIVER_EMAIL]
 
     logging.info("正在发送邮件...")
-    server = smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT)
-    server.login(SENDER_EMAIL, SENDER_PASSWORD)
-    server.sendmail(SENDER_EMAIL, to_addrs, msg.as_string())
-    server.quit()
+    with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT) as server:
+        server.login(SENDER_EMAIL, SENDER_PASSWORD)
+        server.sendmail(SENDER_EMAIL, to_addrs, msg.as_string())
     logging.info(f"邮件已成功发送给：{', '.join(to_addrs)}，共 {len(to_addrs)} 个收件人")
 
 
@@ -293,6 +347,9 @@ def send_generated_email(filename: str, dry_run: bool = False):
 
 def send_email(title: str, content: str, news_date: str, dry_run: bool = False):
     """发送 HTML 邮件（含纯文本备选）；dry_run=True 时保存到本地文件"""
+    if not dry_run:
+        validate_email_config(require_receivers=True)
+
     # 格式化日期
     try:
         clean_date = news_date.strip().replace("/", "-")
@@ -312,7 +369,6 @@ def send_email(title: str, content: str, news_date: str, dry_run: bool = False):
 
     # 每次生成邮件都保留一份 HTML 副本
     save_generated_email_copy(title, html_body)
-    clear_checkpoints()
 
     # Dry run：保存 HTML 到本地文件，不发邮件
     if dry_run:
@@ -340,6 +396,7 @@ def send_email(title: str, content: str, news_date: str, dry_run: bool = False):
 
 def send_log_email():
     """发送运行日志邮件"""
+    validate_email_config(require_receivers=False, require_log_receiver=True)
     if not os.path.exists(LOG_FILE_PATH):
         return
 
@@ -349,7 +406,7 @@ def send_log_email():
     last_log = []
     for line in reversed(log_lines):
         last_log.insert(0, line)
-        if "[自动化任务启动]" in line:
+        if "[\u81ea\u52a8\u5316\u4efb\u52a1\u542f\u52a8]" in line or "[automation start]" in line:
             break
     log_text = "".join(last_log)
 
@@ -360,8 +417,7 @@ def send_log_email():
         f"自动化任务运行日志 - {time.strftime('%Y-%m-%d %H:%M:%S')}", "utf-8"
     )
 
-    server = smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT)
-    server.login(SENDER_EMAIL, SENDER_PASSWORD)
-    server.sendmail(SENDER_EMAIL, [LOG_RECEIVER_EMAIL], message.as_string())
-    server.quit()
+    with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT) as server:
+        server.login(SENDER_EMAIL, SENDER_PASSWORD)
+        server.sendmail(SENDER_EMAIL, [LOG_RECEIVER_EMAIL], message.as_string())
     logging.info(f"日志邮件已发送至 {LOG_RECEIVER_EMAIL}")

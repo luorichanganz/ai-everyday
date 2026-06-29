@@ -11,7 +11,11 @@ from email.utils import parsedate_to_datetime
 from datetime import datetime, timedelta, timezone
 
 import requests
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    def load_dotenv(*args, **kwargs):
+        return False
 
 from checkpoint_manager import get_checkpoint_step, load_checkpoint, save_checkpoint_step
 
@@ -285,17 +289,31 @@ def _pick_original_link_from_secondary_source(article: dict, aggregator_domains:
     return first_link, _source_label_from_link(first_link)
 
 
+def validate_generation_config():
+    """在开始抓取和调用 LLM 前校验必要配置。"""
+    if not OPENROUTER_API_KEY or OPENROUTER_API_KEY == "your-openrouter-api-key":
+        raise RuntimeError("缺少 OPENROUTER_API_KEY，请在 .env 中配置 OpenRouter API Key")
+
+
+def _as_utc_aware(dt: datetime) -> datetime:
+    """统一 RSS 日期为 UTC aware datetime，避免 naive/aware 比较异常。"""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
 def _parse_rss_date(date_str: str | None) -> datetime | None:
     """解析 RSS pubDate 为 datetime 对象"""
     if not date_str:
         return None
+    date_str = date_str.strip()
     try:
-        return parsedate_to_datetime(date_str)
+        return _as_utc_aware(parsedate_to_datetime(date_str))
     except Exception:
         # 尝试常见格式
         for fmt in ["%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d %H:%M:%S"]:
             try:
-                return datetime.strptime(date_str, fmt)
+                return _as_utc_aware(datetime.strptime(date_str, fmt))
             except ValueError:
                 continue
     return None
@@ -1210,6 +1228,7 @@ def sanitize_email_subject(subject: str) -> str:
 
 def generate_weekly_email() -> tuple[str, str, str] | None:
     """生成本周邮件标题、正文和新闻日期。"""
+    validate_generation_config()
     today_str = datetime.now().strftime("%Y-%m-%d")
     checkpoint = load_checkpoint()
 

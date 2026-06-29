@@ -1,15 +1,20 @@
-# 功能：AI 与半导体周报的主入口脚本，串联“生成邮件正文/标题”和“发送邮件”两个模块。
-# 输入：命令行参数 --dry-run/--dry、.env 中的 OpenRouter 与 SMTP 配置、各新闻源在线内容。
-# 输出：正式模式下发送周报邮件和运行日志邮件；dry-run 模式下生成 HTML 预览和本地邮件副本。
+# Entry point for the AI and semiconductor briefing job.
+# Inputs: --dry-run/--dry, .env OpenRouter and SMTP config, online news sources.
+# Outputs: sends briefing and log emails, or writes HTML previews in dry-run mode.
 import os
 import sys
 import time
 import logging
 
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    def load_dotenv(*args, **kwargs):
+        return False
 
 from email_content_generator import generate_weekly_email
 from email_sender import send_email, send_log_email
+from checkpoint_manager import clear_checkpoints
 
 load_dotenv(override=True)
 
@@ -28,30 +33,42 @@ logging.basicConfig(
 
 
 def main(dry_run: bool = False):
-    logging.info("================= [自动化任务启动] =================")
+    logging.info("================= [automation start] =================")
     if dry_run:
-        logging.info("*** 当前为 DRY RUN 模式，不会发送邮件 ***")
+        logging.info("*** DRY RUN: no email will be sent ***")
     start_time = time.time()
+    success = True
+    briefing_sent = False
+    log_email_sent = False
 
     try:
         weekly_email = generate_weekly_email()
         if weekly_email is None:
-            return
+            success = False
+            return success
 
         email_title, email_content, news_date = weekly_email
-
-        # 发送邮件（dry_run 模式下仅保存 HTML 文件）
         send_email(email_title, email_content, news_date, dry_run=dry_run)
+        briefing_sent = not dry_run
 
     except Exception as e:
-        logging.error(f"主程序异常: {e}", exc_info=True)
-
-    elapsed = time.time() - start_time
-    logging.info(f"================= [任务结束 | 耗时: {elapsed:.2f}秒] =================\n")
-    if not dry_run:
-        send_log_email()
+        success = False
+        logging.error(f"Main job failed: {e}", exc_info=True)
+    finally:
+        elapsed = time.time() - start_time
+        logging.info(f"================= [automation end | elapsed: {elapsed:.2f}s] =================\n")
+        if not dry_run:
+            try:
+                send_log_email()
+                log_email_sent = True
+            except Exception as e:
+                success = False
+                logging.error(f"Log email failed: {e}", exc_info=True)
+        if briefing_sent and log_email_sent:
+            clear_checkpoints()
+    return success
 
 
 if __name__ == "__main__":
     dry_run = "--dry-run" in sys.argv or "--dry" in sys.argv
-    main(dry_run=dry_run)
+    sys.exit(0 if main(dry_run=dry_run) else 1)

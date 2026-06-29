@@ -5,7 +5,11 @@ import argparse
 import logging
 import os
 
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    def load_dotenv(*args, **kwargs):
+        return False
 
 from email_sender import GENERATED_EMAIL_DIR, LOG_FILE_PATH, send_generated_email
 
