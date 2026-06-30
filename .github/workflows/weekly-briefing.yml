@@ -30,6 +30,9 @@ jobs:
       RECEIVER_EMAILS: ${{ secrets.RECEIVER_EMAILS }}
       LOG_RECEIVER_EMAIL: ${{ secrets.LOG_RECEIVER_EMAIL }}
       OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      # <-- 新增：LLM 配置（可从 secrets 覆盖，若不设置则使用默认值）
+      LLM_API_URL: ${{ vars.LLM_API_URL }}
+      LLM_MODEL: ${{ vars.LLM_MODEL }}
       SEND_EMAIL_INPUT: ${{ github.event.inputs.send_email || 'false' }}
       CHECKPOINT_RUN_ID: ${{ github.event.inputs.checkpoint_run_id || '' }}
     steps:
@@ -77,6 +80,9 @@ jobs:
           RECEIVER_EMAILS=${RECEIVER_EMAILS}
           LOG_RECEIVER_EMAIL=${LOG_RECEIVER_EMAIL}
           OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+          # <-- 新增：写入 LLM 配置，如果环境变量未定义则使用默认值
+          LLM_API_URL=${LLM_API_URL:-https://openrouter.ai/api/v1/chat/completions}
+          LLM_MODEL=${LLM_MODEL:-deepseek/deepseek-v4-pro}
           EOF
         shell: bash
 
