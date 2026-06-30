@@ -10,10 +10,19 @@ on:
         description: '是否真实发送邮件（true/false）。默认 false = dry-run（只生成预览）'
         required: false
         default: 'false'
+      checkpoint_run_id:
+        description: '可选：从指定失败 run_id 下载 ai-weekly-checkpoint artifact 恢复 checkpoint'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+  actions: read
 
 jobs:
   build-and-run:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     env:
       # 把 secrets 暴露到步骤中以便写 .env
       SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
@@ -22,9 +31,32 @@ jobs:
       LOG_RECEIVER_EMAIL: ${{ secrets.LOG_RECEIVER_EMAIL }}
       OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
       SEND_EMAIL_INPUT: ${{ github.event.inputs.send_email || 'false' }}
+      CHECKPOINT_RUN_ID: ${{ github.event.inputs.checkpoint_run_id || '' }}
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+
+      - name: Restore checkpoint artifact
+        if: ${{ env.CHECKPOINT_RUN_ID != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          echo "Restoring checkpoint from run_id=$CHECKPOINT_RUN_ID"
+          mkdir -p .checkpoints restored-checkpoint
+          gh run download "$CHECKPOINT_RUN_ID" --name ai-weekly-checkpoint --dir restored-checkpoint
+          if [ -d "restored-checkpoint/.checkpoints" ]; then
+            cp -a restored-checkpoint/.checkpoints/. .checkpoints/
+          elif [ -f "restored-checkpoint/ai_daily_briefing.json" ]; then
+            cp restored-checkpoint/ai_daily_briefing.json .checkpoints/
+          else
+            echo "未在 artifact 中找到 checkpoint 文件"
+            find restored-checkpoint -maxdepth 3 -type f -print || true
+            exit 1
+          fi
+          echo "恢复后的 checkpoint 文件："
+          find .checkpoints -maxdepth 2 -type f -print || true
+        shell: bash
 
       - name: Setup Python 3.10
         uses: actions/setup-python@v4
@@ -48,8 +80,18 @@ jobs:
           EOF
         shell: bash
 
+      - name: Count generated emails before run
+        id: generated_before
+        run: |
+          mkdir -p "已生成的邮件"
+          count=$(find "已生成的邮件" -type f -name '*.html' | wc -l | tr -d ' ')
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          echo "运行前已生成邮件数量: $count"
+        shell: bash
+
       - name: Run ai_daily_briefing (dry-run by default)
         run: |
+          set -euo pipefail
           echo "SEND_EMAIL_INPUT=$SEND_EMAIL_INPUT"
           if [ "$SEND_EMAIL_INPUT" = "true" ]; then
             echo "Running real send..."
@@ -60,17 +102,67 @@ jobs:
           fi
         shell: bash
 
+      - name: Check generated emails after run
+        id: generated_after
+        if: ${{ always() }}
+        env:
+          BEFORE_COUNT: ${{ steps.generated_before.outputs.count }}
+        run: |
+          mkdir -p "已生成的邮件"
+          before_count="${BEFORE_COUNT:-0}"
+          after_count=$(find "已生成的邮件" -type f -name '*.html' | wc -l | tr -d ' ')
+          new_count=$((after_count - before_count))
+          if [ "$new_count" -lt 0 ]; then
+            new_count=0
+          fi
+          echo "after_count=$after_count" >> "$GITHUB_OUTPUT"
+          echo "new_count=$new_count" >> "$GITHUB_OUTPUT"
+          if [ "$new_count" -eq 0 ]; then
+            echo "no_generated=true" >> "$GITHUB_OUTPUT"
+            echo "本次运行没有新增 HTML 邮件"
+          else
+            echo "no_generated=false" >> "$GITHUB_OUTPUT"
+            echo "本次运行新增 HTML 邮件数量: $new_count"
+          fi
+        shell: bash
+
       - name: List generated files
+        if: ${{ always() }}
         run: |
           echo "工作目录文件："
           ls -la
+          echo "查看 checkpoint 目录（如存在）："
+          ls -la ".checkpoints" || true
           echo "查看已生成的邮件目录（如存在）："
           ls -la "已生成的邮件" || true
 
       - name: Upload generated HTML as artifact
+        if: ${{ always() && steps.generated_after.outputs.no_generated != 'true' }}
         uses: actions/upload-artifact@v4
         with:
           name: ai-weekly-email
           path: |
             email_preview.html
             已生成的邮件/**/*.html
+          if-no-files-found: error
+
+      - name: Upload checkpoint and logs on failure
+        if: ${{ always() && (failure() || steps.generated_after.outputs.no_generated == 'true') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-weekly-checkpoint
+          path: |
+            .checkpoints/**
+            ai_weekly_briefing.log
+            ai_daily_briefing.log
+            dify_automation_run_log.log
+          if-no-files-found: warn
+          include-hidden-files: true
+          retention-days: 14
+
+      - name: Fail when no generated email
+        if: ${{ always() && steps.generated_after.outputs.no_generated == 'true' }}
+        run: |
+          echo "本次 workflow 没有生成新的 HTML 邮件，标记为失败。checkpoint/log 已上传到 ai-weekly-checkpoint artifact。"
+          exit 1
+        shell: bash

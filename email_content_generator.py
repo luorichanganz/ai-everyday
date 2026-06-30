@@ -1,4 +1,4 @@
-# 功能：抓取 AI 与半导体相关新闻源，筛选去重后调用 LLM 生成邮件正文和主题，并用脚本追加信源。
+﻿# 功能：抓取 AI 与半导体相关新闻源，筛选去重后调用 LLM 生成邮件正文和主题，并用脚本追加信源。
 # 输入：.env 中的 OpenRouter 配置、RSS/Web 新闻源内容、LLM 生成结果。
 # 输出：generate_weekly_email() 返回 (邮件主题, 邮件正文, 新闻日期)；正文中的新闻条目会追加来源链接或来源描述。
 import os
@@ -22,10 +22,10 @@ from checkpoint_manager import get_checkpoint_step, load_checkpoint, save_checkp
 load_dotenv(override=True)
 
 # ================= 配置区域 =================
-# OpenRouter API
+# LLM API 配置（从环境变量读取，支持灵活切换供应商和模型）
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "your-openrouter-api-key")
-OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
-LLM_MODEL = "deepseek/deepseek-v4-pro"
+OPENROUTER_API_URL = os.environ.get("LLM_API_URL", "https://openrouter.ai/api/v1/chat/completions")
+LLM_MODEL = os.environ.get("LLM_MODEL", "deepseek/deepseek-v4-pro")
 
 # RSS 源
 RSS_URL = "https://daily.juya.uk/rss.xml"
@@ -292,7 +292,7 @@ def _pick_original_link_from_secondary_source(article: dict, aggregator_domains:
 def validate_generation_config():
     """在开始抓取和调用 LLM 前校验必要配置。"""
     if not OPENROUTER_API_KEY or OPENROUTER_API_KEY == "your-openrouter-api-key":
-        raise RuntimeError("缺少 OPENROUTER_API_KEY，请在 .env 中配置 OpenRouter API Key")
+        raise RuntimeError("缺少 OPENROUTER_API_KEY，请在 .env 中配置 API Key")
 
 
 def _as_utc_aware(dt: datetime) -> datetime:
@@ -926,7 +926,7 @@ def _deduplicate_articles(articles: list[dict]) -> list[dict]:
 
 
 def call_llm(system_prompt: str, user_message: str = "") -> str:
-    """调用 OpenRouter LLM"""
+    """调用 LLM（API URL 和模型由环境变量 LLM_API_URL / LLM_MODEL 指定）"""
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
@@ -1365,3 +1365,4 @@ def generate_weekly_email() -> tuple[str, str, str] | None:
     logging.info(f"邮件主题: {email_title}")
 
     return email_title, email_content, news_date
+
