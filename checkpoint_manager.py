@@ -1,6 +1,6 @@
 # 功能：管理 AI 周报生成流程的本地 checkpoint，用于中断后恢复进度。
 # 输入：步骤名称和步骤产物数据。
-# 输出：`.checkpoints/ai_daily_briefing.json` checkpoint 文件；也可清理所有 checkpoint。
+# 输出：`.checkpoints/ai_weekly_briefing.json` checkpoint 文件；也可清理所有 checkpoint。
 
 import json
 import logging
@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 CHECKPOINT_DIR = os.path.join(CURRENT_DIR, ".checkpoints")
-CHECKPOINT_FILE = os.path.join(CHECKPOINT_DIR, "ai_daily_briefing.json")
+CHECKPOINT_FILE = os.path.join(CHECKPOINT_DIR, "ai_weekly_briefing.json")
 DEFAULT_CHECKPOINT_TTL_HOURS = 12
 
 

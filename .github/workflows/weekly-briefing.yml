@@ -53,8 +53,8 @@ jobs:
             echo "Restoring checkpoint from ai-weekly-checkpoint artifact"
             if [ -d "restored-checkpoint/.checkpoints" ]; then
               cp -a restored-checkpoint/.checkpoints/. .checkpoints/
-            elif [ -f "restored-checkpoint/ai_daily_briefing.json" ]; then
-              cp restored-checkpoint/ai_daily_briefing.json .checkpoints/
+            elif [ -f "restored-checkpoint/ai_weekly_briefing.json" ]; then
+              cp restored-checkpoint/ai_weekly_briefing.json .checkpoints/
             else
               echo "Warning: checkpoint artifact found but no valid checkpoint data"
               find restored-checkpoint -maxdepth 3 -type f -print || true
@@ -143,17 +143,17 @@ jobs:
           fi
         shell: bash
 
-      - name: Run ai_daily_briefing (dry-run by default)
+      - name: Run ai_weekly_briefing (dry-run by default)
         if: ${{ steps.send_preexisting.outputs.sent != 'true' }}
         run: |
           set -euo pipefail
           echo "SEND_EMAIL_INPUT=$SEND_EMAIL_INPUT"
           if [ "$SEND_EMAIL_INPUT" = "true" ]; then
             echo "Running real send..."
-            python ai_daily_briefing.py
+            python ai_weekly_briefing.py
           else
             echo "Running dry-run (生成预览，不发送邮件)..."
-            python ai_daily_briefing.py --dry-run
+            python ai_weekly_briefing.py --dry-run
           fi
         shell: bash
 
@@ -209,7 +209,7 @@ jobs:
           path: |
             .checkpoints/**
             ai_weekly_briefing.log
-            ai_daily_briefing.log
+            ai_weekly_briefing.log
             dify_automation_run_log.log
           if-no-files-found: warn
           include-hidden-files: true
