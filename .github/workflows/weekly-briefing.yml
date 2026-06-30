@@ -2,8 +2,8 @@ name: Weekly AI Briefing
 
 on:
   schedule:
-    # 每周二 09:35（北京时间）
-    - cron: '35 1 * * 2'
+    # 每周二 13:20（北京时间）
+    - cron: '20 5 * * 2'
   workflow_dispatch:
     inputs:
       send_email:
